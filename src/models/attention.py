@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 try:
     from flash_attn import flash_attn_qkvpacked_func, flash_attn_varlen_qkvpacked_func
@@ -10,13 +11,20 @@ try:
     from flash_attn.layers.rotary import apply_rotary_emb_qkv_
 
     FLASH_ATTN_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised in CPU-only smoke tests.
+except ImportError:  # pragma: no cover - validated at construction time.
     flash_attn_qkvpacked_func = None
     flash_attn_varlen_qkvpacked_func = None
     pad_input = None
     unpad_input = None
     apply_rotary_emb_qkv_ = None
     FLASH_ATTN_AVAILABLE = False
+
+try:
+    from flash_attn.cute import flash_attn_func as cute_flash_attn_func
+    from flash_attn.cute import flash_attn_varlen_func as cute_flash_attn_varlen_func
+except ImportError:  # pragma: no cover - depends on installed flash-attn build.
+    cute_flash_attn_func = None
+    cute_flash_attn_varlen_func = None
 
 
 class RandomProjection(nn.Module):
@@ -96,7 +104,7 @@ class RandomProjection(nn.Module):
 
 class FlashCRA(nn.Module):
     """
-    Collaborative rotary attention with FlashAttention and SDPA fallback.
+    Collaborative rotary attention with FA4-preferred and FA2-fallback execution.
 
     Shape convention:
     - `x`: tokens being updated
@@ -112,9 +120,15 @@ class FlashCRA(nn.Module):
         out_bias: bool = True,
         rotary_interleaved: bool = False,
         phase_scale: float = 1.0,
+        force_fa2: bool = False,
+        fa4_min_cc: int = 90,
     ) -> None:
         super().__init__()
 
+        if not FLASH_ATTN_AVAILABLE:
+            raise ImportError(
+                "FlashCRA requires flash-attn. No non-FlashAttention execution path is enabled."
+            )
         if embed_dim % num_heads != 0:
             raise ValueError(
                 f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
@@ -133,11 +147,61 @@ class FlashCRA(nn.Module):
         self.rotary_interleaved = rotary_interleaved
         self.phase_scale = phase_scale
 
+        self._fa4_available = (
+            cute_flash_attn_func is not None and cute_flash_attn_varlen_func is not None
+        )
+        self._fa4_runtime_disabled = bool(force_fa2)
+        self._fa4_checked = False
+        self._fa4_supported = False
+        self._fa4_min_cc = int(fa4_min_cc)
+
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=qkv_bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=out_bias)
         self.position_projector = RandomProjection(
             embed_dim=embed_dim,
             projected_dim=embed_dim // 2,
+        )
+
+    def _check_cuda_requirements(self, x: torch.Tensor) -> None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("FlashCRA requires CUDA. No CPU attention backend is enabled.")
+        if not x.is_cuda:
+            raise RuntimeError("FlashCRA inputs must be CUDA tensors.")
+
+    def _should_try_fa4(self) -> bool:
+        if not self._fa4_available or self._fa4_runtime_disabled:
+            return False
+        if not self._fa4_checked:
+            self._fa4_supported = self._check_fa4_support()
+            self._fa4_checked = True
+        return self._fa4_supported
+
+    def _check_fa4_support(self) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        try:
+            major, minor = torch.cuda.get_device_capability()
+        except Exception:
+            return False
+        return (major * 10 + minor) >= self._fa4_min_cc
+
+    def _disable_fa4(self, exc: Exception) -> None:
+        if not self._fa4_runtime_disabled:
+            warnings.warn(
+                f"FA4/CuTe attention failed ({type(exc).__name__}: {exc}). Falling back to FA2.",
+                stacklevel=2,
+            )
+        self._fa4_runtime_disabled = True
+
+    @staticmethod
+    def _normalize_attention_output(output: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if torch.is_tensor(output):
+            return output
+        if isinstance(output, tuple) and output and torch.is_tensor(output[0]):
+            return output[0]
+        raise TypeError(
+            "Attention kernel returned an unsupported output type: "
+            f"{type(output).__name__}"
         )
 
     def _phases_from_p(
@@ -214,12 +278,7 @@ class FlashCRA(nn.Module):
         qkv: torch.Tensor,
         phases: torch.Tensor,
     ) -> torch.Tensor:
-        if (
-            not FLASH_ATTN_AVAILABLE
-            or apply_rotary_emb_qkv_ is None
-            or not qkv.is_cuda
-            or phases.requires_grad
-        ):
+        if apply_rotary_emb_qkv_ is None or phases.requires_grad:
             return self._apply_collaborative_rotary_torch(qkv, phases)
 
         qkv = qkv.contiguous()
@@ -234,83 +293,93 @@ class FlashCRA(nn.Module):
                     sin[batch_idx, :, head_idx],
                     interleaved=self.rotary_interleaved,
                 )
-
         return qkv
 
-    def _forward_sdpa(
-        self,
-        qkv: torch.Tensor,
-        key_padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        q = qkv[:, :, 0].transpose(1, 2)  # (B, H, L, Dh)
-        k = qkv[:, :, 1].transpose(1, 2)
-        v = qkv[:, :, 2].transpose(1, 2)
-
-        attn_mask = None
-        if key_padding_mask is not None:
-            valid_keys = (~key_padding_mask).unsqueeze(1).unsqueeze(2)
-            attn_mask = valid_keys.expand(-1, self.num_heads, q.shape[-2], -1)
-
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
+    def _run_fa2_dense(self, qkv: torch.Tensor) -> torch.Tensor:
+        return flash_attn_qkvpacked_func(
+            qkv.contiguous(),
             dropout_p=self.attn_dropout if self.training else 0.0,
-            scale=self.softmax_scale,
+            softmax_scale=self.softmax_scale,
         )
-        out = out.transpose(1, 2).reshape(qkv.shape[0], qkv.shape[1], self.embed_dim)
-        out = self.out_proj(out)
-        if key_padding_mask is not None:
-            out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-        return out
 
-    def _forward_flash(
-        self,
-        qkv: torch.Tensor,
-        key_padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        dropout_p = self.attn_dropout if self.training else 0.0
-        batch_size, seqlen = qkv.shape[0], qkv.shape[1]
-
-        if key_padding_mask is None:
-            out = flash_attn_qkvpacked_func(
-                qkv,
-                dropout_p=dropout_p,
+    def _run_fa4_dense(self, qkv: torch.Tensor) -> torch.Tensor:
+        q, k, v = qkv.contiguous().unbind(dim=2)
+        return self._normalize_attention_output(
+            cute_flash_attn_func(
+                q,
+                k,
+                v,
                 softmax_scale=self.softmax_scale,
+                causal=False,
             )
-            out = out.reshape(batch_size, seqlen, self.embed_dim)
-            return self.out_proj(out)
+        )
 
-        attention_mask = ~key_padding_mask
-        unpad_outputs = unpad_input(qkv, attention_mask)
-        if len(unpad_outputs) == 4:
-            qkv_unpad, indices, cu_seqlens, max_seqlen = unpad_outputs
-        elif len(unpad_outputs) == 5:
-            qkv_unpad, indices, cu_seqlens, max_seqlen, _ = unpad_outputs
-        else:
-            raise ValueError(
-                f"Unexpected number of outputs from unpad_input: {len(unpad_outputs)}"
+    def _run_fa2_varlen(
+        self,
+        qkv_unpad: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        return flash_attn_varlen_qkvpacked_func(
+            qkv_unpad.contiguous(),
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            softmax_scale=self.softmax_scale,
+        )
+
+    def _run_fa4_varlen(
+        self,
+        qkv_unpad: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        q_unpad, k_unpad, v_unpad = qkv_unpad.contiguous().unbind(dim=1)
+        return self._normalize_attention_output(
+            cute_flash_attn_varlen_func(
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=self.softmax_scale,
+                causal=False,
             )
+        )
 
-        if qkv_unpad.shape[0] == 0:
-            out = qkv.new_zeros(batch_size, seqlen, self.embed_dim)
-            out = self.out_proj(out)
-            out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-            return out
+    def _run_dense_attention(self, qkv: torch.Tensor) -> torch.Tensor:
+        if self._should_try_fa4():
+            try:
+                return self._run_fa4_dense(qkv)
+            except Exception as exc:
+                self._disable_fa4(exc)
+        return self._run_fa2_dense(qkv)
 
-        out_unpad = flash_attn_varlen_qkvpacked_func(
+    def _run_varlen_attention(
+        self,
+        qkv_unpad: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        if self._should_try_fa4():
+            try:
+                return self._run_fa4_varlen(
+                    qkv_unpad,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+            except Exception as exc:
+                self._disable_fa4(exc)
+        return self._run_fa2_varlen(
             qkv_unpad,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            dropout_p=dropout_p,
-            softmax_scale=self.softmax_scale,
         )
-        out = pad_input(out_unpad, indices, batch_size, seqlen)
-        out = out.reshape(batch_size, seqlen, self.embed_dim)
-        out = self.out_proj(out)
-        out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-        return out
 
     def forward(
         self,
@@ -351,6 +420,8 @@ class FlashCRA(nn.Module):
         if rotary_mask is not None and rotary_mask.dtype != torch.bool:
             rotary_mask = rotary_mask.to(torch.bool)
 
+        self._check_cuda_requirements(x)
+
         qkv = self.qkv_proj(x).reshape(
             batch_size,
             seqlen,
@@ -361,12 +432,35 @@ class FlashCRA(nn.Module):
         phases = self._phases_from_p(p, rotary_mask=rotary_mask)
         qkv = self._apply_collaborative_rotary(qkv, phases)
 
-        can_use_flash = (
-            FLASH_ATTN_AVAILABLE
-            and flash_attn_qkvpacked_func is not None
-            and x.is_cuda
-            and qkv.dtype in {torch.float16, torch.bfloat16}
+        if key_padding_mask is None:
+            out = self._run_dense_attention(qkv)
+            out = out.reshape(batch_size, seqlen, self.embed_dim)
+            return self.out_proj(out)
+
+        attention_mask = ~key_padding_mask
+        unpad_outputs = unpad_input(qkv, attention_mask)
+        if len(unpad_outputs) == 4:
+            qkv_unpad, indices, cu_seqlens, max_seqlen = unpad_outputs
+        elif len(unpad_outputs) == 5:
+            qkv_unpad, indices, cu_seqlens, max_seqlen, _ = unpad_outputs
+        else:
+            raise ValueError(
+                f"Unexpected number of outputs from unpad_input: {len(unpad_outputs)}"
+            )
+
+        if qkv_unpad.shape[0] == 0:
+            out = x.new_zeros(batch_size, seqlen, self.embed_dim)
+            out = self.out_proj(out)
+            out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+            return out
+
+        out_unpad = self._run_varlen_attention(
+            qkv_unpad,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
-        if can_use_flash:
-            return self._forward_flash(qkv, key_padding_mask=key_padding_mask)
-        return self._forward_sdpa(qkv, key_padding_mask=key_padding_mask)
+        out = pad_input(out_unpad, indices, batch_size, seqlen)
+        out = out.reshape(batch_size, seqlen, self.embed_dim)
+        out = self.out_proj(out)
+        out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+        return out

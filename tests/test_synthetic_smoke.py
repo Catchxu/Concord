@@ -1,6 +1,7 @@
 import logging
 
 import torch
+import pytest
 
 from src.data import ConcordCollator, GeneVocab, SyntheticDatasetConfig, build_synthetic_dataset
 from src.losses import PretrainingLossManager
@@ -18,12 +19,13 @@ from src.train.distributed import RuntimeContext, build_dataloader
 from src.train.trainer import CellFineTuneSystem, PretrainingSystem, Trainer, build_optimizer, build_scheduler
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashAttention execution requires CUDA.")
 def test_tiny_end_to_end_synthetic_run(tmp_path):
     runtime = RuntimeContext(
         rank=0,
         world_size=1,
         local_rank=0,
-        device=torch.device("cpu"),
+        device=torch.device("cuda"),
         distributed=False,
         is_main=True,
     )

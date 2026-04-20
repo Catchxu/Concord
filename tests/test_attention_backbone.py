@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from src.models import FlashCRA, TransformerBackbone
 
@@ -17,7 +18,27 @@ def test_flashcra_zeroes_cls_phase_when_rotary_mask_disabled():
     assert torch.allclose(phases[:, 0], torch.zeros_like(phases[:, 0]))
 
 
-def test_backbone_runs_on_cpu_with_padding_and_rotary_mask():
+def test_flashcra_fa4_failure_falls_back_to_fa2(monkeypatch):
+    attn = FlashCRA(embed_dim=16, num_heads=4, attn_dropout=0.0)
+    attn._fa4_available = True
+    attn._fa4_checked = True
+    attn._fa4_supported = True
+    attn._fa4_runtime_disabled = False
+
+    expected = torch.randn(2, 5, 4, 4)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("fa4 fail")
+
+    monkeypatch.setattr(attn, "_run_fa4_dense", _raise)
+    monkeypatch.setattr(attn, "_run_fa2_dense", lambda qkv: expected)
+
+    out = attn._run_dense_attention(torch.randn(2, 5, 3, 4, 4))
+    assert out is expected
+    assert attn._fa4_runtime_disabled
+
+
+def test_backbone_requires_cuda_for_attention():
     model = TransformerBackbone(
         embed_dim=32,
         num_layers=2,
@@ -38,6 +59,5 @@ def test_backbone_runs_on_cpu_with_padding_and_rotary_mask():
     rotary_mask = ~padding
     rotary_mask[:, 0] = False
 
-    out = model(x, p, key_padding_mask=padding, rotary_mask=rotary_mask)
-    assert out.shape == x.shape
-    assert torch.all(out[padding] == 0)
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        model(x, p, key_padding_mask=padding, rotary_mask=rotary_mask)

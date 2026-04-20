@@ -52,6 +52,8 @@ class TransformerBlock(nn.Module):
         norm_eps: float = 1e-6,
         rotary_interleaved: bool = False,
         phase_scale: float = 1.0,
+        force_fa2: bool = False,
+        fa4_min_cc: int = 90,
     ) -> None:
         super().__init__()
         self.attn_norm = nn.RMSNorm(embed_dim, eps=norm_eps)
@@ -63,6 +65,8 @@ class TransformerBlock(nn.Module):
             out_bias=out_bias,
             rotary_interleaved=rotary_interleaved,
             phase_scale=phase_scale,
+            force_fa2=force_fa2,
+            fa4_min_cc=fa4_min_cc,
         )
         self.mlp_norm = nn.RMSNorm(embed_dim, eps=norm_eps)
         self.mlp = SwiGLUMLP(
@@ -108,6 +112,8 @@ class TransformerBackbone(nn.Module):
         norm_eps: float = 1e-6,
         rotary_interleaved: bool = False,
         phase_scale: float = 1.0,
+        force_fa2: bool = False,
+        fa4_min_cc: int = 90,
     ) -> None:
         super().__init__()
         if num_layers <= 0:
@@ -131,6 +137,8 @@ class TransformerBackbone(nn.Module):
                     norm_eps=norm_eps,
                     rotary_interleaved=rotary_interleaved,
                     phase_scale=phase_scale,
+                    force_fa2=force_fa2,
+                    fa4_min_cc=fa4_min_cc,
                 )
                 for _ in range(num_layers)
             ]

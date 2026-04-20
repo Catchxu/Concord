@@ -51,7 +51,9 @@ This repo keeps the original CRA/backbone implementation as the core and builds 
 - The shared backbone stays close to the existing implementation.
 - `SwiGLUMLP` is preserved instead of replacing it with a different MLP block.
 - CLS tokens do not receive collaborative rotary phase transforms.
-- FlashAttention is used when available, with a PyTorch SDPA fallback for CPU-safe smoke runs.
+- Attention execution follows the `scCAFM` style:
+  prefer FA4/CuTe kernels when supported, otherwise fall back to FA2.
+- No non-FlashAttention execution path is enabled for the Concord attention stack.
 - Pretraining defaults to three sequential phases:
   1. expression reconstruction
   2. gene prediction
@@ -77,6 +79,8 @@ Optional extras:
 - `.[singlecell]` for `anndata` and sparse single-cell inputs
 - `.[flash]` for FlashAttention
 
+FlashAttention-backed model execution requires CUDA.
+
 ## Run
 
 Pretraining:
@@ -97,7 +101,7 @@ Gene-level fine-tuning:
 python -m src.train.finetune --config configs/finetune_gene.yaml
 ```
 
-The shipped configs use paper-style model defaults such as `embed_dim=768`, `num_layers=12`, `num_heads=12`, and `max_tokens=2048`. The default CLI dataset path is synthetic so the repo can run without a large external corpus.
+The shipped configs use paper-style model defaults such as `embed_dim=768`, `num_layers=12`, `num_heads=12`, and `max_tokens=2048`. The default CLI dataset path is synthetic so the repo can run without a large external corpus, but actual model execution still requires CUDA because the attention stack is FlashAttention-only.
 
 ## Batch Format
 
@@ -147,4 +151,4 @@ Current smoke coverage includes:
 - tokenizer determinism
 - modular pretraining losses
 - checkpoint save/load
-- tiny synthetic pretrain and fine-tune flows
+- tiny synthetic pretrain and fine-tune flows on CUDA
