@@ -43,6 +43,8 @@ This repo keeps the original CRA/backbone implementation as the core and builds 
   Config loading, distributed helpers, FSDP wrapping, checkpointing, pretraining, and fine-tuning.
 - `configs/`
   Shared defaults plus pretraining and fine-tuning configs.
+- `scripts/`
+  Shell launchers for pretraining, cell-level fine-tuning, and gene-level fine-tuning.
 - `tests/`
   Smoke tests for the backbone, tokenizers, losses, checkpoints, and a tiny synthetic run.
 
@@ -89,16 +91,34 @@ Pretraining:
 python -m src.train.pretrain --config configs/pretrain.yaml
 ```
 
+or
+
+```bash
+bash scripts/run_pretrain.sh
+```
+
 Cell-level fine-tuning:
 
 ```bash
 python -m src.train.finetune --config configs/finetune_cta.yaml
 ```
 
+or
+
+```bash
+bash scripts/run_finetune_cta.sh
+```
+
 Gene-level fine-tuning:
 
 ```bash
 python -m src.train.finetune --config configs/finetune_gene.yaml
+```
+
+or
+
+```bash
+bash scripts/run_finetune_gene.sh
 ```
 
 The shipped configs use paper-style model defaults such as `embed_dim=768`, `num_layers=12`, `num_heads=12`, and `max_tokens=2048`. The default CLI dataset path is synthetic so the repo can run without a large external corpus, but actual model execution still requires CUDA because the attention stack is FlashAttention-only.
