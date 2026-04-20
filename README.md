@@ -1,91 +1,85 @@
-# Concord
+# Concord: Building Consensus Representations for Single Cells with Collaborative Random Projection
 
-Concord is a dual-token single-cell foundation model that keeps gene identity tokens and expression-value tokens separate while updating them with one shared Transformer backbone and collaborative rotary attention.
+Concord is a dual-token single-cell model. Each cell is represented with:
 
-This repo preserves the existing CRA/backbone implementation in `src/models/attention.py` and `src/models/backbone.py`, then builds the surrounding production scaffolding around it:
+- gene tokens for gene identity
+- expression tokens for expression value
 
-- dual-mode `ConcordModel`
-- gene and expression tokenizers
-- modular pretraining losses and heads
-- dense/sparse/AnnData-ready dataset interfaces
-- FSDP-first training helpers with CPU-safe fallbacks
-- checkpointing and resume support
-- smoke tests on tiny synthetic data
+Both token streams use one shared Transformer backbone. In expression mode, gene tokens condition expression updates. In gene mode, expression tokens condition gene updates.
 
-## What Is Implemented
+<br/>
+<div align=center>
+<img src="/docs/framework.png" width="70%">
+</div>
+<br/>
 
-- `src/models/attention.py`
-  - existing `RandomProjection` and `FlashCRA`
-  - added optional `rotary_mask` so `[g-cls]` and `[e-cls]` do not receive collaborative rotary phases
-  - added PyTorch SDPA fallback for CPU or non-FlashAttention execution
-- `src/models/backbone.py`
-  - existing `SwiGLUMLP`, `TransformerBlock`, and `TransformerBackbone`
-  - threaded `rotary_mask` through the shared backbone API
+## Framework
+
+The framework figure shows the full training story:
+
+- `a`: dual tokenization plus a shared CRA backbone
+- `b`: masked gene prediction in gene mode
+- `c`: masked expression reconstruction in expression mode
+- `d`: `[g-cls]` and `[e-cls]` aggregation with cell-level contrastive learning
+
+This repo keeps the original CRA/backbone implementation as the core and builds the missing training and data stack around it.
+
+## What Is In This Repo
+
+- `src/models/attention.py`, `src/models/backbone.py`
+  Collaborative rotary attention and the shared Transformer backbone.
 - `src/models/tokenizers.py`
-  - `GeneTokenizer` with optional Gene2Vec initialization hook
-  - `ExpressionTokenizer` with configurable fixed-bin `log1p` discretization
+  Gene and expression tokenizers, including CLS handling and expression binning.
 - `src/models/concord_model.py`
-  - `forward_expression_mode(...)`
-  - `forward_gene_mode(...)`
-  - `forward_pretrain(..., phase=...)`
+  The dual-mode `ConcordModel` wrapper with:
+  `forward_expression_mode(...)`, `forward_gene_mode(...)`, and `forward_pretrain(...)`.
 - `src/models/heads.py`
-  - expression reconstruction head
-  - masked gene prediction head
-  - cell-level and gene-level downstream heads
+  Pretraining heads and downstream task heads.
 - `src/data/`
-  - `GeneVocab`
-  - dataset wrappers for dense arrays, torch tensors, scipy sparse matrices, and AnnData
-  - collator that builds Concord batches with CLS-aware rotary and masking tensors
+  Gene vocabulary, dataset wrappers, masking, and collate logic.
 - `src/losses/`
-  - expression reconstruction loss
-  - masked gene prediction loss
-  - symmetric cell contrastive loss
+  Expression reconstruction, masked gene prediction, and cell contrastive losses.
 - `src/train/`
-  - config loading with includes
-  - distributed/FSDP helpers
-  - checkpoint manager
-  - shared trainer
-  - pretraining and fine-tuning entrypoints
+  Config loading, distributed helpers, FSDP wrapping, checkpointing, pretraining, and fine-tuning.
+- `configs/`
+  Shared defaults plus pretraining and fine-tuning configs.
+- `tests/`
+  Smoke tests for the backbone, tokenizers, losses, checkpoints, and a tiny synthetic run.
 
 ## Important Defaults
 
-- The backbone keeps `SwiGLUMLP` rather than switching to GEGLU. This is a deliberate preservation choice to stay compatible with the existing implementation base.
-- Masked gene prediction defaults to gene-identity prediction because the paper names gene categories but does not specify a concrete label source in the provided spec.
-- Default pretraining follows sequential phases:
+- The shared backbone stays close to the existing implementation.
+- `SwiGLUMLP` is preserved instead of replacing it with a different MLP block.
+- CLS tokens do not receive collaborative rotary phase transforms.
+- FlashAttention is used when available, with a PyTorch SDPA fallback for CPU-safe smoke runs.
+- Pretraining defaults to three sequential phases:
   1. expression reconstruction
   2. gene prediction
   3. cell contrastive alignment
-- Sequence construction uses non-zero genes only, sorted by descending expression and truncated to `max_tokens - 1`, then prepends a CLS token.
+- Masked gene prediction currently defaults to gene identity prediction, because the paper mentions gene categories but does not specify a concrete category source in the provided spec.
 
-## Install
+## Quick Start
 
-Minimal install:
+Install:
 
 ```bash
 python -m pip install -e .
 ```
 
-For tests:
+Install with tests:
 
 ```bash
 python -m pip install -e .[dev]
 ```
 
-For AnnData or scipy sparse inputs:
+Optional extras:
 
-```bash
-python -m pip install -e .[singlecell]
-```
+- `.[singlecell]` for `anndata` and sparse single-cell inputs
+- `.[flash]` for FlashAttention
 
-FlashAttention is optional because the repo now has a CPU-safe SDPA fallback:
+## Run
 
-```bash
-python -m pip install -e .[flash]
-```
-
-## Running
-
-Pretraining with the shipped config:
+Pretraining:
 
 ```bash
 python -m src.train.pretrain --config configs/pretrain.yaml
@@ -103,11 +97,11 @@ Gene-level fine-tuning:
 python -m src.train.finetune --config configs/finetune_gene.yaml
 ```
 
-The shipped configs use paper-style model defaults (`embed_dim=768`, `num_layers=12`, `num_heads=12`, `max_tokens=2048`) but point at a tiny synthetic dataset so the repo is runnable without an external corpus.
+The shipped configs use paper-style model defaults such as `embed_dim=768`, `num_layers=12`, `num_heads=12`, and `max_tokens=2048`. The default CLI dataset path is synthetic so the repo can run without a large external corpus.
 
-## Batch Contract
+## Batch Format
 
-The collator standardizes Concord batches around these keys:
+The collator standardizes training batches around:
 
 - `gene_ids`
 - `expression_values`
@@ -119,7 +113,7 @@ The collator standardizes Concord batches around these keys:
 - `expression_targets`
 - `gene_targets`
 
-Cell-level fine-tuning additionally uses `cell_labels`. Gene-level fine-tuning can use `gene_labels` when provided by the dataset.
+Fine-tuning may additionally use `cell_labels` or `gene_labels`.
 
 ## Checkpoints
 
@@ -129,28 +123,28 @@ Checkpoints are written under the run directory, for example:
 outputs/pretrain/checkpoints/
 ```
 
-The manager writes:
+The checkpoint manager stores:
 
-- a manifest with the latest checkpoint path
 - model state
 - optimizer state
 - scheduler state
-- trainer state for resume
+- trainer state
+- a manifest pointing to the latest checkpoint
 
-When FSDP wraps the training system, model weights are saved through an FSDP-aware sharded state path.
+When FSDP is active, model state is saved through an FSDP-aware sharded checkpoint path.
 
-## Smoke Tests
+## Tests
 
-Run the test suite with:
+Run the smoke suite with:
 
 ```bash
 pytest
 ```
 
-The smoke tests cover:
+Current smoke coverage includes:
 
-- backbone and CPU fallback behavior
-- tokenizer behavior
+- backbone shape and masking behavior
+- tokenizer determinism
 - modular pretraining losses
-- checkpoint save/load roundtrips
-- a tiny synthetic pretrain + fine-tune flow
+- checkpoint save/load
+- tiny synthetic pretrain and fine-tune flows
