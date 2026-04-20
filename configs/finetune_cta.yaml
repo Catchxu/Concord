@@ -1,0 +1,13 @@
+includes:
+  - base.yaml
+
+trainer:
+  output_dir: outputs/finetune_cta
+  epochs: 3
+
+task:
+  type: cell_classification
+  num_classes: 8
+  pool: cls
+  dropout: 0.1
+  freeze_backbone: false

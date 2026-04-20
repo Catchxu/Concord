@@ -1,0 +1,11 @@
+includes:
+  - base.yaml
+
+trainer:
+  output_dir: outputs/finetune_gene
+  epochs: 3
+
+task:
+  type: gene_task
+  output_dim: 4
+  freeze_backbone: false

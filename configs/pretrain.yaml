@@ -1,0 +1,18 @@
+includes:
+  - base.yaml
+
+trainer:
+  output_dir: outputs/pretrain
+  epochs_per_phase: 1
+
+pretrain:
+  phase_order:
+    - expression_reconstruction
+    - gene_prediction
+    - contrastive
+  expression_mask_ratio: 0.15
+  gene_mask_ratio: 0.15
+  expression_weight: 1.0
+  gene_weight: 1.0
+  contrastive_weight: 1.0
+  contrastive_temperature: 0.1
